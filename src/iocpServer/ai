@@ -1,0 +1,625 @@
+// iocpserver.cpp - Refactored version
+// A high-performance Winsock echo server using I/O Completion Ports (IOCP)
+
+#pragma warning(disable:4127 4267)
+
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <Ws2tcpip.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <strsafe.h>
+#include "iocpserver.h"
+
+// Memory management macros
+#define xmalloc(s) HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (s))
+#define xfree(p)   HeapFree(GetProcessHeap(), 0, (p))
+
+// Global variables
+namespace {
+    char* g_Port = DEFAULT_PORT;
+    bool g_bEndServer = false;
+    bool g_bRestart = true;
+    bool g_bVerbose = false;
+    DWORD g_dwThreadCount = 0;
+    HANDLE g_hIOCP = INVALID_HANDLE_VALUE;
+    SOCKET g_sdListen = INVALID_SOCKET;
+    HANDLE g_ThreadHandles[MAX_WORKER_THREAD];
+    PPER_SOCKET_CONTEXT g_pCtxtList = nullptr;
+    CRITICAL_SECTION g_CriticalSection;
+}
+
+// Forward declarations
+namespace {
+    bool ValidOptions(int argc, char* argv[]);
+    BOOL WINAPI CtrlHandler(DWORD dwEvent);
+    bool CreateListenSocket();
+    DWORD WINAPI WorkerThread(LPVOID WorkThreadContext);
+    PPER_SOCKET_CONTEXT UpdateCompletionPort(SOCKET sd, IO_OPERATION ClientIo, bool bAddToList);
+    void CloseClient(PPER_SOCKET_CONTEXT lpPerSocketContext, bool bGraceful);
+    PPER_SOCKET_CONTEXT CtxtAllocate(SOCKET sd, IO_OPERATION ClientIO);
+    void CtxtListAddTo(PPER_SOCKET_CONTEXT lpPerSocketContext);
+    void CtxtListDeleteFrom(PPER_SOCKET_CONTEXT lpPerSocketContext);
+    void CtxtListFree();
+    int myprintf(const char* lpFormat, ...);
+}
+
+// Main entry point
+int main(int argc, char* argv[]) {
+    SYSTEM_INFO systemInfo;
+    WSADATA wsaData;
+    int nRet = 0;
+
+    // Initialize thread handles
+    for (int i = 0; i < MAX_WORKER_THREAD; i++) {
+        g_ThreadHandles[i] = INVALID_HANDLE_VALUE;
+    }
+
+    if (!ValidOptions(argc, argv)) return 1;
+
+    if (!SetConsoleCtrlHandler(CtrlHandler, TRUE)) {
+        myprintf("SetConsoleCtrlHandler() failed: %d\n", GetLastError());
+        return 1;
+    }
+
+    // Determine thread count based on CPU cores
+    GetSystemInfo(&systemInfo);
+    g_dwThreadCount = systemInfo.dwNumberOfProcessors * 2;
+
+    // Initialize Winsock
+    if ((nRet = WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        myprintf("WSAStartup() failed: %d\n", nRet);
+        return 1;
+    }
+
+    // Initialize critical section
+    __try {
+        InitializeCriticalSection(&g_CriticalSection);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        myprintf("InitializeCriticalSection raised exception.\n");
+        WSACleanup();
+        return 1;
+    }
+
+    // Main server loop (restarts on CTRL-BREAK)
+    while (g_bRestart) {
+        g_bRestart = false;
+        g_bEndServer = false;
+
+        __try {
+            // Create I/O completion port
+            g_hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+            if (g_hIOCP == NULL) {
+                myprintf("CreateIoCompletionPort() failed: %d\n", GetLastError());
+                __leave;
+            }
+
+            // Create worker threads
+            for (DWORD dwCPU = 0; dwCPU < g_dwThreadCount; dwCPU++) {
+                DWORD dwThreadId = 0;
+                HANDLE hThread = CreateThread(NULL, 0, WorkerThread, g_hIOCP, 0, &dwThreadId);
+                
+                if (hThread == NULL) {
+                    myprintf("CreateThread() failed: %d\n", GetLastError());
+                    __leave;
+                }
+                
+                g_ThreadHandles[dwCPU] = hThread;
+            }
+
+            // Create listening socket
+            if (!CreateListenSocket()) __leave;
+
+            // Main accept loop
+            while (true) {
+                SOCKET sdAccept = WSAAccept(g_sdListen, NULL, NULL, NULL, 0);
+                if (sdAccept == SOCKET_ERROR) {
+                    myprintf("WSAAccept() failed: %d\n", WSAGetLastError());
+                    __leave;
+                }
+
+                // Add new socket to IOCP
+                PPER_SOCKET_CONTEXT lpPerSocketContext = 
+                    UpdateCompletionPort(sdAccept, ClientIoRead, true);
+                
+                if (lpPerSocketContext == NULL) __leave;
+                if (g_bEndServer) break;
+
+                // Post initial receive
+                DWORD dwRecvNumBytes = 0;
+                DWORD dwFlags = 0;
+                nRet = WSARecv(sdAccept, &(lpPerSocketContext->pIOContext->wsabuf),
+                                1, &dwRecvNumBytes, &dwFlags,
+                                &(lpPerSocketContext->pIOContext->Overlapped), NULL);
+                
+                if (nRet == SOCKET_ERROR && (ERROR_IO_PENDING != WSAGetLastError())) {
+                    myprintf("WSARecv() Failed: %d\n", WSAGetLastError());
+                    CloseClient(lpPerSocketContext, false);
+                }
+            }
+        }
+        __finally {
+            g_bEndServer = true;
+
+            // Signal worker threads to exit
+            if (g_hIOCP) {
+                for (DWORD i = 0; i < g_dwThreadCount; i++) {
+                    PostQueuedCompletionStatus(g_hIOCP, 0, 0, NULL);
+                }
+            }
+
+            // Wait for worker threads to exit
+            if (WAIT_OBJECT_0 != WaitForMultipleObjects(g_dwThreadCount, g_ThreadHandles, 
+                                                        TRUE, 1000)) {
+                myprintf("WaitForMultipleObjects() failed: %d\n", GetLastError());
+            }
+            else {
+                for (DWORD i = 0; i < g_dwThreadCount; i++) {
+                    if (g_ThreadHandles[i] != INVALID_HANDLE_VALUE) {
+                        CloseHandle(g_ThreadHandles[i]);
+                        g_ThreadHandles[i] = INVALID_HANDLE_VALUE;
+                    }
+                }
+            }
+
+            // Cleanup resources
+            CtxtListFree();
+
+            if (g_hIOCP) {
+                CloseHandle(g_hIOCP);
+                g_hIOCP = NULL;
+            }
+
+            if (g_sdListen != INVALID_SOCKET) {
+                closesocket(g_sdListen);
+                g_sdListen = INVALID_SOCKET;
+            }
+        }
+
+        myprintf("\niocpserver is %s...\n", g_bRestart ? "restarting" : "exiting");
+    }
+
+    // Final cleanup
+    DeleteCriticalSection(&g_CriticalSection);
+    WSACleanup();
+    SetConsoleCtrlHandler(CtrlHandler, FALSE);
+    return 0;
+}
+
+// Validate command line options
+bool ValidOptions(int argc, char* argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if ((argv[i][0] == '-') || (argv[i][0] == '/')) {
+            switch (tolower(argv[i][1])) {
+                case 'e':
+                    if (strlen(argv[i]) > 3) g_Port = &argv[i][3];
+                    break;
+                case 'v':
+                    g_bVerbose = true;
+                    break;
+                case '?':
+                    myprintf("Usage:\n  iocpserver [-p:port] [-v] [-?]\n");
+                    myprintf("  -e:port\tSpecify echoing port number\n");
+                    myprintf("  -v\t\tVerbose\n");
+                    myprintf("  -?\t\tDisplay this help\n");
+                    return false;
+                default:
+                    myprintf("Unknown option: %s\n", argv[i]);
+                    return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Console control handler
+BOOL WINAPI CtrlHandler(DWORD dwEvent) {
+    SOCKET sockTemp = INVALID_SOCKET;
+
+    switch (dwEvent) {
+        case CTRL_BREAK_EVENT:
+            g_bRestart = true;
+            // Fall through
+        case CTRL_C_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+        case CTRL_CLOSE_EVENT:
+            if (g_bVerbose) {
+                myprintf("CtrlHandler: closing listening socket\n");
+            }
+
+            sockTemp = g_sdListen;
+            g_sdListen = INVALID_SOCKET;
+            g_bEndServer = true;
+            closesocket(sockTemp);
+            break;
+        default:
+            return FALSE;
+    }
+    return TRUE;
+}
+
+// Create listening socket
+bool CreateListenSocket() {
+    struct addrinfo hints = { 0 };
+    struct addrinfo* addrlocal = NULL;
+    int nRet = 0;
+
+    hints.ai_flags = AI_PASSIVE;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_IP;
+
+    if (getaddrinfo(NULL, g_Port, &hints, &addrlocal) != 0) {
+        myprintf("getaddrinfo() failed: %d\n", WSAGetLastError());
+        return false;
+    }
+
+    if (addrlocal == NULL) {
+        myprintf("getaddrinfo() failed to resolve interface\n");
+        return false;
+    }
+
+    // Create socket
+    g_sdListen = WSASocket(addrlocal->ai_family, addrlocal->ai_socktype, 
+                          addrlocal->ai_protocol, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (g_sdListen == INVALID_SOCKET) {
+        myprintf("WSASocket() failed: %d\n", WSAGetLastError());
+        freeaddrinfo(addrlocal);
+        return false;
+    }
+
+    // Bind and listen
+    if ((nRet = bind(g_sdListen, addrlocal->ai_addr, (int)addrlocal->ai_addrlen)) == SOCKET_ERROR) {
+        myprintf("bind() failed: %d\n", WSAGetLastError());
+        freeaddrinfo(addrlocal);
+        return false;
+    }
+
+    if ((nRet = listen(g_sdListen, 5)) == SOCKET_ERROR) {
+        myprintf("listen() failed: %d\n", WSAGetLastError());
+        freeaddrinfo(addrlocal);
+        return false;
+    }
+
+    // Disable send buffering
+    int nZero = 0;
+    if (setsockopt(g_sdListen, SOL_SOCKET, SO_SNDBUF, (char*)&nZero, sizeof(nZero)) == SOCKET_ERROR) {
+        myprintf("setsockopt(SNDBUF) failed: %d\n", WSAGetLastError());
+        freeaddrinfo(addrlocal);
+        return false;
+    }
+
+    freeaddrinfo(addrlocal);
+    return true;
+}
+
+// Worker thread processing I/O completions
+DWORD WINAPI WorkerThread(LPVOID WorkThreadContext) {
+    HANDLE hIOCP = (HANDLE)WorkThreadContext;
+    DWORD dwIoSize = 0;
+    PPER_SOCKET_CONTEXT lpPerSocketContext = nullptr;
+    LPWSAOVERLAPPED lpOverlapped = nullptr;
+
+    while (true) {
+        BOOL bSuccess = GetQueuedCompletionStatus(hIOCP, &dwIoSize,
+            (PDWORD_PTR)&lpPerSocketContext,
+            (LPOVERLAPPED*)&lpOverlapped, INFINITE);
+
+        if (!bSuccess) {
+            myprintf("GetQueuedCompletionStatus() failed: %d\n", GetLastError());
+        }
+
+        // Check for shutdown signal
+        if (lpPerSocketContext == nullptr || g_bEndServer) {
+            return 0;
+        }
+
+        // Handle client disconnect
+        if (!bSuccess || (bSuccess && (dwIoSize == 0))) {
+            CloseClient(lpPerSocketContext, false);
+            continue;
+        }
+
+        // Process I/O operation
+        PPER_IO_CONTEXT lpIOContext = (PPER_IO_CONTEXT)lpOverlapped;
+        switch (lpIOContext->IOOperation) {
+            case ClientIoRead:
+                HandleReadCompletion(lpPerSocketContext, lpIOContext, dwIoSize);
+                break;
+            case ClientIoWrite:
+                HandleWriteCompletion(lpPerSocketContext, lpIOContext, dwIoSize);
+                break;
+        }
+    }
+    return 0;
+}
+
+// Helper function to handle read completions
+void HandleReadCompletion(PPER_SOCKET_CONTEXT lpPerSocketContext, 
+                         PPER_IO_CONTEXT lpIOContext, DWORD dwIoSize) {
+    // Convert read to write operation
+    lpIOContext->IOOperation = ClientIoWrite;
+    lpIOContext->nTotalBytes = dwIoSize;
+    lpIOContext->nSentBytes = 0;
+    lpIOContext->wsabuf.len = dwIoSize;
+
+    DWORD dwSendNumBytes = 0;
+    DWORD dwFlags = 0;
+    int nRet = WSASend(lpPerSocketContext->Socket, &lpIOContext->wsabuf, 1,
+                      &dwSendNumBytes, dwFlags, &(lpIOContext->Overlapped), NULL);
+
+    if (nRet == SOCKET_ERROR && (ERROR_IO_PENDING != WSAGetLastError())) {
+        myprintf("WSASend() failed: %d\n", WSAGetLastError());
+        CloseClient(lpPerSocketContext, false);
+    }
+    else if (g_bVerbose) {
+        myprintf("WorkerThread %d: Socket(%d) Recv completed (%d bytes), Send posted\n",
+               GetCurrentThreadId(), lpPerSocketContext->Socket, dwIoSize);
+    }
+}
+
+// Helper function to handle write completions
+void HandleWriteCompletion(PPER_SOCKET_CONTEXT lpPerSocketContext,
+                          PPER_IO_CONTEXT lpIOContext, DWORD dwIoSize) {
+    lpIOContext->nSentBytes += dwIoSize;
+    DWORD dwFlags = 0;
+
+    if (lpIOContext->nSentBytes < lpIOContext->nTotalBytes) {
+        // Partial write - send remaining data
+        WSABUF buffSend;
+        buffSend.buf = lpIOContext->Buffer + lpIOContext->nSentBytes;
+        buffSend.len = lpIOContext->nTotalBytes - lpIOContext->nSentBytes;
+
+        DWORD dwSendNumBytes = 0;
+        int nRet = WSASend(lpPerSocketContext->Socket, &buffSend, 1,
+                          &dwSendNumBytes, dwFlags, &(lpIOContext->Overlapped), NULL);
+
+        if (nRet == SOCKET_ERROR && (ERROR_IO_PENDING != WSAGetLastError())) {
+            myprintf("WSASend() failed: %d\n", WSAGetLastError());
+            CloseClient(lpPerSocketContext, false);
+        }
+        else if (g_bVerbose) {
+            myprintf("WorkerThread %d: Socket(%d) Send partially completed (%d bytes)\n",
+                   GetCurrentThreadId(), lpPerSocketContext->Socket, dwIoSize);
+        }
+    }
+    else {
+        // Full write completed - post new read
+        lpIOContext->IOOperation = ClientIoRead;
+        lpIOContext->wsabuf.len = MAX_BUFF_SIZE;
+
+        DWORD dwRecvNumBytes = 0;
+        int nRet = WSARecv(lpPerSocketContext->Socket, &lpIOContext->wsabuf, 1,
+                          &dwRecvNumBytes, &dwFlags, &lpIOContext->Overlapped, NULL);
+
+        if (nRet == SOCKET_ERROR && (ERROR_IO_PENDING != WSAGetLastError())) {
+            myprintf("WSARecv() failed: %d\n", WSAGetLastError());
+            CloseClient(lpPerSocketContext, false);
+        }
+        else if (g_bVerbose) {
+            myprintf("WorkerThread %d: Socket(%d) Send completed (%d bytes), Recv posted\n",
+                   GetCurrentThreadId(), lpPerSocketContext->Socket, dwIoSize);
+        }
+    }
+}
+
+// Add socket to completion port
+PPER_SOCKET_CONTEXT UpdateCompletionPort(SOCKET sd, IO_OPERATION ClientIo, bool bAddToList) {
+    PPER_SOCKET_CONTEXT lpPerSocketContext = CtxtAllocate(sd, ClientIo);
+    if (lpPerSocketContext == nullptr) return nullptr;
+
+    g_hIOCP = CreateIoCompletionPort((HANDLE)sd, g_hIOCP, (DWORD_PTR)lpPerSocketContext, 0);
+    if (g_hIOCP == nullptr) {
+        myprintf("CreateIoCompletionPort() failed: %d\n", GetLastError());
+        xfree(lpPerSocketContext->pIOContext);
+        xfree(lpPerSocketContext);
+        return nullptr;
+    }
+
+    if (bAddToList) CtxtListAddTo(lpPerSocketContext);
+
+    if (g_bVerbose) {
+        myprintf("UpdateCompletionPort: Socket(%d) added to IOCP\n", lpPerSocketContext->Socket);
+    }
+
+    return lpPerSocketContext;
+}
+
+// Close client connection
+void CloseClient(PPER_SOCKET_CONTEXT lpPerSocketContext, bool bGraceful) {
+    __try {
+        EnterCriticalSection(&g_CriticalSection);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        myprintf("EnterCriticalSection raised an exception.\n");
+        return;
+    }
+
+    if (lpPerSocketContext) {
+        if (g_bVerbose) {
+            myprintf("CloseClient: Socket(%d) closing (graceful=%s)\n",
+                   lpPerSocketContext->Socket, (bGraceful ? "TRUE" : "FALSE"));
+        }
+
+        if (!bGraceful) {
+            LINGER lingerStruct = { 1, 0 };
+            setsockopt(lpPerSocketContext->Socket, SOL_SOCKET, SO_LINGER,
+                     (char*)&lingerStruct, sizeof(lingerStruct));
+        }
+
+        closesocket(lpPerSocketContext->Socket);
+        lpPerSocketContext->Socket = INVALID_SOCKET;
+        CtxtListDeleteFrom(lpPerSocketContext);
+    }
+    else {
+        myprintf("CloseClient: lpPerSocketContext is NULL\n");
+    }
+
+    LeaveCriticalSection(&g_CriticalSection);
+}
+
+// Allocate socket context
+PPER_SOCKET_CONTEXT CtxtAllocate(SOCKET sd, IO_OPERATION ClientIO) {
+    __try {
+        EnterCriticalSection(&g_CriticalSection);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        myprintf("EnterCriticalSection raised an exception.\n");
+        return nullptr;
+    }
+
+    PPER_SOCKET_CONTEXT lpPerSocketContext = (PPER_SOCKET_CONTEXT)xmalloc(sizeof(PER_SOCKET_CONTEXT));
+    if (!lpPerSocketContext) {
+        myprintf("HeapAlloc() PER_SOCKET_CONTEXT failed: %d\n", GetLastError());
+        LeaveCriticalSection(&g_CriticalSection);
+        return nullptr;
+    }
+
+    lpPerSocketContext->pIOContext = (PPER_IO_CONTEXT)xmalloc(sizeof(PER_IO_CONTEXT));
+    if (!lpPerSocketContext->pIOContext) {
+        xfree(lpPerSocketContext);
+        myprintf("HeapAlloc() PER_IO_CONTEXT failed: %d\n", GetLastError());
+        LeaveCriticalSection(&g_CriticalSection);
+        return nullptr;
+    }
+
+    // Initialize context
+    lpPerSocketContext->Socket = sd;
+    lpPerSocketContext->pCtxtBack = nullptr;
+    lpPerSocketContext->pCtxtForward = nullptr;
+
+    ZeroMemory(&lpPerSocketContext->pIOContext->Overlapped, sizeof(WSAOVERLAPPED));
+    lpPerSocketContext->pIOContext->IOOperation = ClientIO;
+    lpPerSocketContext->pIOContext->pIOContextForward = nullptr;
+    lpPerSocketContext->pIOContext->nTotalBytes = 0;
+    lpPerSocketContext->pIOContext->nSentBytes = 0;
+    lpPerSocketContext->pIOContext->wsabuf.buf = lpPerSocketContext->pIOContext->Buffer;
+    lpPerSocketContext->pIOContext->wsabuf.len = sizeof(lpPerSocketContext->pIOContext->Buffer);
+    ZeroMemory(lpPerSocketContext->pIOContext->Buffer, sizeof(lpPerSocketContext->pIOContext->Buffer));
+
+    LeaveCriticalSection(&g_CriticalSection);
+    return lpPerSocketContext;
+}
+
+// Add context to global list
+void CtxtListAddTo(PPER_SOCKET_CONTEXT lpPerSocketContext) {
+    __try {
+        EnterCriticalSection(&g_CriticalSection);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        myprintf("EnterCriticalSection raised an exception.\n");
+        return;
+    }
+
+    if (g_pCtxtList == nullptr) {
+        // First node in list
+        lpPerSocketContext->pCtxtBack = nullptr;
+        lpPerSocketContext->pCtxtForward = nullptr;
+        g_pCtxtList = lpPerSocketContext;
+    }
+    else {
+        // Add to head of list
+        PPER_SOCKET_CONTEXT pTemp = g_pCtxtList;
+        g_pCtxtList = lpPerSocketContext;
+        lpPerSocketContext->pCtxtBack = pTemp;
+        lpPerSocketContext->pCtxtForward = nullptr;
+        pTemp->pCtxtForward = lpPerSocketContext;
+    }
+
+    LeaveCriticalSection(&g_CriticalSection);
+}
+
+// Delete context from global list
+void CtxtListDeleteFrom(PPER_SOCKET_CONTEXT lpPerSocketContext) {
+    __try {
+        EnterCriticalSection(&g_CriticalSection);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        myprintf("EnterCriticalSection raised an exception.\n");
+        return;
+    }
+
+    if (lpPerSocketContext) {
+        PPER_SOCKET_CONTEXT pBack = lpPerSocketContext->pCtxtBack;
+        PPER_SOCKET_CONTEXT pForward = lpPerSocketContext->pCtxtForward;
+
+        // Update list pointers
+        if (!pBack && !pForward) {
+            g_pCtxtList = nullptr;
+        }
+        else if (!pBack && pForward) {
+            pForward->pCtxtBack = nullptr;
+            g_pCtxtList = pForward;
+        }
+        else if (pBack && !pForward) {
+            pBack->pCtxtForward = nullptr;
+        }
+        else if (pBack && pForward) {
+            pBack->pCtxtForward = pForward;
+            pForward->pCtxtBack = pBack;
+        }
+
+        // Free I/O contexts
+        PPER_IO_CONTEXT pTempIO = lpPerSocketContext->pIOContext;
+        while (pTempIO) {
+            PPER_IO_CONTEXT pNextIO = pTempIO->pIOContextForward;
+            
+            if (g_bEndServer) {
+                while (!HasOverlappedIoCompleted((LPOVERLAPPED)pTempIO)) Sleep(0);
+            }
+            
+            xfree(pTempIO);
+            pTempIO = pNextIO;
+        }
+
+        xfree(lpPerSocketContext);
+    }
+    else {
+        myprintf("CtxtListDeleteFrom: lpPerSocketContext is NULL\n");
+    }
+
+    LeaveCriticalSection(&g_CriticalSection);
+}
+
+// Free all contexts
+void CtxtListFree() {
+    __try {
+        EnterCriticalSection(&g_CriticalSection);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        myprintf("EnterCriticalSection raised an exception.\n");
+        return;
+    }
+
+    PPER_SOCKET_CONTEXT pTemp = g_pCtxtList;
+    while (pTemp) {
+        PPER_SOCKET_CONTEXT pNext = pTemp->pCtxtBack;
+        CloseClient(pTemp, false);
+        pTemp = pNext;
+    }
+
+    LeaveCriticalSection(&g_CriticalSection);
+}
+
+// Thread-safe printf alternative
+int myprintf(const char* lpFormat, ...) {
+    char cBuffer[512];
+    va_list arglist;
+    DWORD nLen = 0;
+    HRESULT hRet;
+
+    va_start(arglist, lpFormat);
+    hRet = StringCchVPrintf(cBuffer, sizeof(cBuffer), lpFormat, arglist);
+    va_end(arglist);
+
+    if (SUCCEEDED(hRet)) {
+        HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (hOut != INVALID_HANDLE_VALUE) {
+            WriteConsole(hOut, cBuffer, (DWORD)strlen(cBuffer), &nLen, NULL);
+        }
+    }
+
+    return (int)nLen;
+}

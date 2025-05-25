@@ -1,0 +1,31 @@
+#include <WinSock2.h>
+#include <stdio.h>
+
+int CALLBACK ConditionAcceptFunc(
+    LPWSABUF lpCallerId,
+    LPWSABUF lpCallerData,
+    LPQOS pQos,
+    LPQOS lpGQOS,
+    LPWSABUF lpCalleeId,
+    LPWSABUF lpCalleeData,
+    GROUP FAR * g,
+    DWORD_PTR dwCallbackData
+    )
+{
+
+    if (pQos != NULL) {
+        RtlZeroMemory(pQos, sizeof(QOS));
+        return CF_ACCEPT;
+    } else
+        return CF_REJECT;
+}
+
+struct sockaddr_in saClient;
+int iClientSize = sizeof(saClient);
+SOCKET ListenSocket, AcceptSocket;
+
+void f1(){
+    AcceptSocket = WSAAccept(ListenSocket, (SOCKADDR*) &saClient, &iClientSize, &ConditionAcceptFunc, NULL);
+}
+
+void f3(struct sockaddr_in addr, LPCONDITIONPROC func)
